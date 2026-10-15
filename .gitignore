@@ -1,0 +1,15 @@
+dist/
+build/
+__pycache__/
+*.exe
+*.previous
+*.pending
+*.log
+.env
+*fishing-settings.json
+*fishing-session.json
+*secret*
+*token*
+updates/
+node_modules/
+.private-fixtures/

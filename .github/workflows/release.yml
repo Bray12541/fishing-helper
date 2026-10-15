@@ -1,0 +1,31 @@
+name: Windows release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p test_updates.py
+      - run: npm ci --prefix app/hud-ocr
+      - run: python -m PyInstaller --noconfirm fishing.spec
+      - name: Generate checksum feed
+        shell: pwsh
+        run: |
+          Copy-Item -LiteralPath 'dist/Fishing Helper.exe' -Destination 'dist/FishingHelper.exe'
+          python make_feed.py --repository $env:GITHUB_REPOSITORY --tag $env:GITHUB_REF_NAME
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/FishingHelper.exe dist/latest.json --title "Fishing Helper $env:GITHUB_REF_NAME" --generate-notes --verify-tag

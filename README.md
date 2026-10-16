@@ -33,3 +33,18 @@ The EXE is in `dist`. Saved settings, bot tokens, webhook credentials, logs, ses
 Update `APP_VERSION` in `app/fishing_helper.py` and `fishing_version.txt`, commit the change, then push a matching tag such as `v4.5`. The release workflow builds the Windows app, generates its checksum feed, and publishes `FishingHelper.exe` and `latest.json` as release assets. The workflow uses the repository's GitHub Actions token; no Discord token or personal GitHub token belongs in repository files.
 
 The updater checks the latest published version; it does not invent or build new fixes. The publisher must release a new version before users see an update. Automated/native offline checks do not guarantee uninterrupted live gameplay.
+
+
+## Updates in 4.5
+
+The app displays release notes, download progress/speed and Cancel. Download while fishing, then use Update and restart while stopped or select Install downloaded update when fishing stops. Cleanup and countdowns must finish first. Skipped versions and next-day reminders persist locally; a manual Check clears deferrals.
+
+Stable uses the latest public release. Beta uses the dedicated beta/latest.json release asset and can receive previews. Tag vVERSION for Stable or vVERSION-beta for Beta; APP_VERSION remains numeric. The workflow prevents a lower Stable version from replacing a newer Beta feed.
+
+Updates installed by 4.5+ wait up to 90 seconds for a version/token acknowledgement after eight seconds of a responsive native control loop. A failed launch, exited replacement, missing/invalid acknowledgement, or startup control error triggers rollback and restart of the previous EXE. The initial upgrade from 4.4 still uses 4.4's original installer. This is a startup check, not an overnight gameplay guarantee.
+
+### Publisher signing
+
+This release is unsigned. To enable signing, provide a valid trusted code-signing PFX through repository secrets WINDOWS_SIGN_PFX_BASE64 and WINDOWS_SIGN_PASSWORD, or replace sign-release.ps1 with your hardware-backed signing provider. The workflow signs before hashing and records the certificate thumbprint in the feed. Never commit the certificate or password. See Microsoft's [Authenticode signing documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-authenticodesignature).
+
+The client verifies Windows trust for signed feed entries. Users may require trusted signatures and optionally pin a publisher certificate SHA-1 thumbprint; SHA-256 continues to verify file integrity. Requiring a signature blocks unsigned releases. A certificate pin must be supplied through a trusted channel; feed metadata alone does not establish a fixed publisher identity.

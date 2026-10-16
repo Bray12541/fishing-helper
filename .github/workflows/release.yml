@@ -19,6 +19,12 @@ jobs:
       - run: python -m unittest discover -s tests -p test_updates.py
       - run: npm ci --prefix app/hud-ocr
       - run: python -m PyInstaller --noconfirm fishing.spec
+      - name: Sign release when a publisher certificate is configured
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+        run: ./sign-release.ps1
       - name: Generate checksum feed
         shell: pwsh
         run: |
@@ -28,4 +34,22 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist/FishingHelper.exe dist/latest.json --title "Fishing Helper $env:GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: |
+          $releaseFlags=if ($env:GITHUB_REF_NAME.EndsWith('-beta')) { @('--prerelease','--latest=false') } else { @('--latest') }
+          gh release create $env:GITHUB_REF_NAME dist/FishingHelper.exe dist/latest.json --title "Fishing Helper $env:GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag @releaseFlags
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+          $newFeed=Get-Content dist/latest.json -Raw | ConvertFrom-Json
+          $replaceBeta=$true
+          try {
+            $existing=Invoke-RestMethod "https://github.com/$env:GITHUB_REPOSITORY/releases/download/beta/latest.json"
+            if ([version]$existing.version -gt [version]$newFeed.version) { $replaceBeta=$false }
+          } catch { }
+          if ($replaceBeta) {
+            gh release view beta *> $null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create beta --target $env:GITHUB_SHA --prerelease --latest=false --title 'Beta update feed' --notes 'Preview channel feed. Stable users do not download preview releases.'
+              if ($LASTEXITCODE -ne 0) { throw 'Beta feed creation failed' }
+            }
+            gh release upload beta dist/latest.json --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Beta feed upload failed' }
+          }

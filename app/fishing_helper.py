@@ -26,7 +26,7 @@ from fishing_session import RunJournal,SessionStore,RUN_DEFAULTS,parse_target,ex
 from fishing_safety import OvernightSafety
 from fishing_reliability import RELIABILITY_DEFAULTS,parse_reserve,parse_health_minutes,HudReadError,RecoveryBudget,FailureRecorder
 from fishing_remote import REMOTE_DEFAULTS,DiscordControls,RemoteReply,remote_settings,protect_token,unprotect_token
-from fishing_updates import UPDATE_DEFAULTS,UpdateManager,feed_url
+from fishing_updates import UPDATE_DEFAULTS,UpdateManager,feed_url,channel_feed,preferences as update_preferences,acknowledge_startup
 
 TOGGLE_KEY = 0x5A
 STOP_KEY = 0x78
@@ -35,7 +35,7 @@ KEY_HOLD_SECONDS = .045
 MIN_RING_RADIUS = 28
 END_CONFIRM_SECONDS = .7
 DEFAULT_DELAY = 1.5
-APP_VERSION = '4.4'
+APP_VERSION = '4.5'
 DEFAULT_SETTINGS = dict(catch_delay=DEFAULT_DELAY, needs_enabled=True,
                         hunger_threshold=20, thirst_threshold=20, item_wait=8,overlay_enabled=False,
                         wait_limit=180,rod_slots=ROD_PRIORITY,overnight_safety=True)
@@ -170,8 +170,7 @@ def load_settings(path):
                 except (OSError,ValueError,UnicodeError):settings['remote_enabled']=False
             try:settings.update(remote_settings(settings))
             except ValueError:settings['remote_enabled']=False
-            if type(data.get('update_check_startup')) is bool:settings['update_check_startup']=data['update_check_startup']
-            try:settings['update_feed_url']=feed_url(data.get('update_feed_url') or UPDATE_DEFAULTS['update_feed_url'])
+            try:settings.update(update_preferences(data))
             except ValueError:pass
     except (OSError, ValueError, TypeError, OverflowError):
         pass
@@ -1783,7 +1782,7 @@ class App:
         for variable in (*self.discord_vars.values(),self.discord_url):
             variable.trace_add('write',self.queue_settings_save)
         for variable in self.remote_vars.values():variable.trace_add('write',self.queue_settings_save)
-        for variable in (self.update_feed,self.update_startup):variable.trace_add('write',self.queue_settings_save)
+        for variable in (self.update_feed,self.update_startup,self.update_channel,self.update_when_idle,self.update_require_signed,self.update_publisher):variable.trace_add('write',self.queue_settings_save)
         self.status.trace_add('write', self.refresh_ui)
         self.refresh_ui()
         if saved:self.status.set('Paused. Saved session restored; press Z in FiveM to resume.')
@@ -1791,7 +1790,7 @@ class App:
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self.poll_after = self.root.after(25, self.poll)
         if self.settings.get('remote_enabled',False):self.remote.connect()
-        if self.settings.get('update_check_startup',True):self.root.after(1500,self.check_updates)
+        if self.settings.get('update_check_startup',True):self.root.after(1500,lambda:self.check_updates(manual=False))
 
     def build_ui(self):
         build_dashboard(self,APP_VERSION,draw_tracking)
@@ -1888,7 +1887,10 @@ class App:
             inventory_reserve_kg=parse_reserve(self.inventory_reserve.get()),health_minutes=parse_health_minutes(self.health_minutes.get()),
             **{key:var.get() for key,var in self.reliability_vars.items()},
             **remote_settings({key:var.get() for key,var in self.remote_vars.items()}),
-            update_feed_url=feed_url(self.update_feed.get()),update_check_startup=self.update_startup.get())
+            **update_preferences(dict(update_feed_url=self.update_feed.get(),update_check_startup=self.update_startup.get(),
+                update_channel=self.update_channel.get().lower(),update_when_idle=self.update_when_idle.get(),
+                update_require_signed=self.update_require_signed.get(),update_publisher=self.update_publisher.get(),
+                update_skip=self.settings.get('update_skip',''),update_remind_after=self.settings.get('update_remind_after',0))))
 
     def queue_settings_save(self, *_):
         if self.closing:return
@@ -2194,9 +2196,11 @@ class App:
             return
         try:
             self.poll_controls()
+            self.health_poll_passes=getattr(self,'health_poll_passes',0)+1;self.health_last_poll=time.monotonic()
         except Exception as error:
             self.pause()
             self.status.set(f'Paused: control update failed: {error}')
+            self.health_control_failed=True
             LOGGER.exception('control_update_failed')
         finally:
             if not self.closing:
@@ -2329,37 +2333,81 @@ class App:
         if not opened.get():button.invoke()
         self.root.after_idle(lambda:self.viewport.yview_moveto(1))
 
-    def check_updates(self):
+    def acknowledge_update(self,path,token):
+        if (self.closing or getattr(self,'health_control_failed',False) or getattr(self,'health_poll_passes',0)<10
+                or time.monotonic()-getattr(self,'health_last_poll',0)>1):return False
+        acknowledge_startup(path,token,APP_VERSION);return True
+
+    def check_updates(self,manual=True):
         if self.closing or self.updating:return
-        try:self.updater.check(feed_url(self.update_feed.get()))
+        if manual:
+            self.settings['update_skip']='';self.settings['update_remind_after']=0;self.queue_settings_save()
+        try:self.updater.check(channel_feed(self.update_feed.get(),self.update_channel.get().lower()),self.update_channel.get().lower())
         except ValueError as error:self.update_feedback.set(str(error))
+
+    def update_busy(self):
+        return bool(self.pending_start or (self.worker and not self.worker.stop.is_set()) or (getattr(self,'thread',None) and self.thread.is_alive()))
+
+    def download_update(self):
+        if self.closing or self.updating:return
+        self.updater.require_signed=self.update_require_signed.get()
+        self.updater.publisher=self.update_publisher.get().strip().upper().replace(' ','')
+        try:source=channel_feed(self.update_feed.get(),self.update_channel.get().lower())
+        except ValueError as error:self.update_feedback.set(str(error));return
+        if source!=self.updater.source or self.update_channel.get().lower()!=self.updater.channel:self.check_updates();return
+        self.updater.prepare()
+
+    def cancel_update(self):
+        self.install_requested=False;self.update_when_idle.set(False);self.updater.cancel_download()
+
+    def defer_update(self,skip=False):
+        item=self.updater.snapshot()[1]
+        if not item:return
+        self.settings['update_skip']=(self.update_channel.get().lower()+':'+item['version']) if skip else ''
+        self.settings['update_remind_after']=0 if skip else int(time.time()+86400)
+        self.install_requested=False;self.update_when_idle.set(False);self.updater.cancel_download()
+        self.queue_settings_save()
 
     def install_update(self):
         if self.closing or self.updating:return
         if not getattr(sys,'frozen',False):
             self.update_feedback.set('Automatic replacement is available in the EXE. Source installs can use the release files.');return
-        if (self.pending_start or (self.worker and not self.worker.stop.is_set()) or (getattr(self,'thread',None) and self.thread.is_alive())):
-            self.update_feedback.set('Pause fishing and wait for cleanup before updating.');return
-        try:source=feed_url(self.update_feed.get())
-        except ValueError as error:self.update_feedback.set(str(error));return
-        if source!=self.updater.source:self.check_updates();return
-        if self.updater.prepare():self.updating=True
+        if self.update_busy():
+            self.update_feedback.set('Pause fishing and wait for cleanup before updating. Use Download update to prepare it in the background.');return
+        self.install_requested=True
+        if not self.updater.ready:self.download_update()
 
     def poll_updates(self):
         state,item,installing,ready=self.updater.snapshot()
+        detail=self.updater.details()
         if self.update_feedback.get()!=state:self.update_feedback.set(state)
-        title=('Update '+item['version']+' available · Settings') if item else 'Version '+APP_VERSION
+        suppressed=bool(item and (self.settings.get('update_skip')==self.update_channel.get().lower()+':'+item['version'] or time.time()<self.settings.get('update_remind_after',0)))
+        title=('Update '+item['version']+' available · Settings') if item and not suppressed else 'Version '+APP_VERSION
         if self.version_text.get()!=title:self.version_text.set(title)
         desired='normal' if item and not self.updating else 'disabled'
         if str(self.update_install_button.cget('state'))!=desired:self.update_install_button.configure(state=desired)
-        if self.updating and ready:
-            try:
-                self.updater.handoff(sys.executable,ASSET_DIR/'fishing-update.ps1')
+        self.update_download_button.configure(state='normal' if item and not installing and not ready else 'disabled')
+        self.update_cancel_button.configure(state='normal' if installing or ready else 'disabled')
+        self.update_progress['value']=detail['progress']
+        text=('Version '+item['version']+' · '+item.get('channel','stable').title()+'\n'+item.get('notes','No release notes supplied.')) if item else 'No newer release found. Check for updates to refresh.'
+        if suppressed:text+='\nNotice hidden. Check for updates to show it again.'
+        if ready:text+='\n'+detail['signature']
+        if self.update_release_text.get()!=text:self.update_release_text.set(text)
+        try:current_feed=channel_feed(self.update_feed.get(),self.update_channel.get().lower())
+        except ValueError:current_feed=None
+        if ready and (self.updater.channel!=self.update_channel.get().lower() or self.updater.source!=current_feed or self.updater.require_signed!=self.update_require_signed.get() or self.updater.publisher!=self.update_publisher.get().strip().upper().replace(' ','')):
+            self.cancel_update();self.updater.state='Update preferences changed. Download again to verify with the new preferences.';return
+        if ready and (getattr(self,'install_requested',False) or self.update_when_idle.get()) and not self.update_busy():
+            if not getattr(sys,'frozen',False):
+                self.install_requested=False;self.update_when_idle.set(False);self.updater.state='Update ready. Source installs must replace files manually.';return
+            self.updating=True
+            try:self.updater.handoff(sys.executable,ASSET_DIR/'fishing-update.ps1')
             except (OSError,ValueError):
-                self.updating=False;self.updater.ready=None
+                self.updating=False;self.install_requested=False;self.updater.ready=None
                 self.updater.state='Update could not start. Current app was kept; close and retry.';return
             self.close()
-        elif self.updating and not installing:self.updating=False
+        elif getattr(self,'install_requested',False) and not ready and detail['phase'] in ('failed','cancelled'):
+            self.install_requested=False
 
     def remote_action(self,action):
         if self.closing:return RemoteReply('The helper is closing. No action was taken.')
@@ -2439,6 +2487,9 @@ def main(resume_stats=None):
     app = None
     try:
         app = App(resume_stats,session_path=data_dir()/'fishing-session.json')
+        if '--update-health' in sys.argv and '--update-token' in sys.argv:
+            health_path=sys.argv[sys.argv.index('--update-health')+1];health_token=sys.argv[sys.argv.index('--update-token')+1]
+            app.root.after(8000,lambda:app.acknowledge_update(health_path,health_token))
         app.root.mainloop()
     finally:
         if app is not None:

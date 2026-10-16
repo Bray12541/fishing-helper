@@ -76,4 +76,64 @@ class UpdateTests(unittest.TestCase):
         plan=json.loads(Path(args[-1]).read_text());self.assertEqual(plan['target'],str(target.resolve()))
         self.assertEqual(plan['sha256'],manifest()['sha256'])
 
+class Update45Tests(unittest.TestCase):
+    setUp=UpdateTests.setUp
+    wait=UpdateTests.wait
+    def test_stable_rejects_beta_and_beta_uses_dedicated_feed(self):
+        with self.assertRaises(ValueError):u.release({**manifest(),'channel':'beta'},'4.4',self.folder,True,'stable')
+        self.assertEqual(u.release({**manifest(),'channel':'beta'},'4.4',self.folder,True,'beta')['channel'],'beta')
+        self.assertEqual(u.channel_feed(u.DEFAULT_FEED,'beta'),u.BETA_FEED)
+        self.assertEqual(u.channel_feed(u.BETA_FEED,'stable'),u.DEFAULT_FEED)
+        self.assertEqual(u.channel_feed('https://example.com/feed','beta'),'https://example.com/feed')
+    def test_preferences_validate_channel_pin_and_preserve_deferral(self):
+        values=u.preferences(dict(update_channel='invalid',update_skip='stable:4.5',update_remind_after=123))
+        self.assertEqual(values['update_channel'],'stable');self.assertEqual(values['update_skip'],'stable:4.5');self.assertEqual(values['update_remind_after'],123)
+        with self.assertRaises(ValueError):u.preferences(dict(update_publisher='bad'))
+    def test_retry_connection_error_then_download_succeeds(self):
+        transport=MagicMock();transport.open.side_effect=[OSError('dropped'),Reply(binary())]
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=transport
+        self.assertTrue(self.c.prepare());self.wait()
+        self.assertEqual(transport.open.call_count,2);self.assertIsNotNone(self.c.ready)
+        self.assertEqual(self.c.details()['progress'],100);self.assertGreater(self.c.details()['speed'],0)
+    def test_exhausted_retries_keep_current_app_and_allow_retry(self):
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=MagicMock();self.c.opener.open.side_effect=OSError('offline')
+        self.c.prepare();self.wait();self.assertEqual(self.c.opener.open.call_count,3);self.assertIsNone(self.c.ready)
+        self.assertEqual(self.c.phase,'failed');self.assertFalse(self.c.installing)
+    def test_cancel_mid_stream_never_exposes_ready_file(self):
+        manager=self.c
+        class CancelReply(Reply):
+            def read(self,count=-1):
+                manager.cancel_download();return super().read(count)
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=MagicMock();self.c.opener.open.return_value=CancelReply(binary())
+        self.c.prepare();self.wait();self.assertIsNone(self.c.ready);self.assertEqual(self.c.phase,'cancelled');self.assertFalse(self.c.installing)
+        self.assertFalse(list((self.folder/'staging').rglob('new.exe')))
+    def test_cancel_ready_download_cleans_staging(self):
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=Transport(binary());self.c.prepare();self.wait()
+        path=Path(self.c.ready);self.assertTrue(self.c.cancel_download());self.assertFalse(path.exists());self.assertIsNone(self.c.ready)
+    def test_required_signature_blocks_unsigned_and_wrong_publisher(self):
+        pin='A'*40
+        with patch.object(u.subprocess,'run',return_value=MagicMock(returncode=0,stdout=json.dumps(dict(status='NotSigned',thumbprint='')))):
+            with self.assertRaises(ValueError):u.verify_signature(self.folder/'new.exe',required=True)
+        with patch.object(u.subprocess,'run',return_value=MagicMock(returncode=0,stdout=json.dumps(dict(status='Valid',thumbprint='B'*40)))):
+            with self.assertRaises(ValueError):u.verify_signature(self.folder/'new.exe',pin)
+        with patch.object(u.subprocess,'run',return_value=MagicMock(returncode=0,stdout=json.dumps(dict(status='Valid',thumbprint=pin)))):
+            self.assertIn('verified',u.verify_signature(self.folder/'new.exe',pin))
+    def test_signature_failure_does_not_offer_install(self):
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=Transport(binary());self.c.require_signed=True
+        with patch.object(u,'verify_signature',side_effect=ValueError('Untrusted')):self.c.prepare();self.wait()
+        self.assertIsNone(self.c.ready);self.assertEqual(self.c.phase,'failed')
+    def test_startup_ack_requires_correct_token_path_and_version(self):
+        path=self.folder/'startup-health.json';token='a'*64
+        (self.folder/'plan.json').write_text(json.dumps(dict(health_path=str(path),health_token=token,version='4.5')))
+        for wrong_token,wrong_version in [('b'*64,'4.5'),(token,'4.6')]:
+            with self.assertRaises(ValueError):u.acknowledge_startup(path,wrong_token,wrong_version)
+        self.assertFalse(path.exists());u.acknowledge_startup(path,token,'4.5')
+        self.assertEqual(json.loads(path.read_text())['token'],token)
+    def test_handoff_contains_health_token_and_unique_stage_path(self):
+        self.c.available=u.release(manifest(),'4.4',self.folder);self.c.opener=Transport(binary());self.c.prepare();self.wait()
+        target=self.folder/'installed.exe';target.write_bytes(b'old');script=self.folder/'helper.ps1';script.write_text('# mock')
+        with patch.object(u.subprocess,'Popen'):self.c.handoff(target,script)
+        plan=json.loads((Path(self.c.ready).parent/'plan.json').read_text());self.assertEqual(len(plan['health_token']),64)
+        self.assertEqual(Path(plan['health_path']).parent,Path(self.c.ready).parent);self.assertEqual(plan['version'],'4.5')
+
 if __name__=='__main__':unittest.main()

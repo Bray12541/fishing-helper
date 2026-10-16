@@ -2,13 +2,23 @@ name: Windows release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
 permissions:
   contents: write
 jobs:
   release:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.release_tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
@@ -29,14 +39,14 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item -LiteralPath 'dist/Fishing Helper.exe' -Destination 'dist/FishingHelper.exe'
-          python make_feed.py --repository $env:GITHUB_REPOSITORY --tag $env:GITHUB_REF_NAME
+          python make_feed.py --repository $env:GITHUB_REPOSITORY --tag $env:RELEASE_TAG
       - name: Publish release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $releaseFlags=if ($env:GITHUB_REF_NAME.EndsWith('-beta')) { @('--prerelease','--latest=false') } else { @('--latest') }
-          gh release create $env:GITHUB_REF_NAME dist/FishingHelper.exe dist/latest.json --title "Fishing Helper $env:GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag @releaseFlags
+          [string[]]$releaseFlags=@(if ($env:RELEASE_TAG.EndsWith('-beta')) { '--prerelease';'--latest=false' } else { '--latest' })
+          gh release create $env:RELEASE_TAG dist/FishingHelper.exe dist/latest.json --title "Fishing Helper $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md --verify-tag @releaseFlags
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
           $newFeed=Get-Content dist/latest.json -Raw | ConvertFrom-Json
           $replaceBeta=$true
